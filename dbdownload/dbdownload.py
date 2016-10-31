@@ -101,7 +101,14 @@ class DBDownload(object):
 
     def start(self):
         try:
-            self._monitor()
+            while True:
+                self._monitor()
+                if self.sleep:
+                    self._logger.debug('sleeping for %d second(s)' % self.sleep)
+                    time.sleep(self.sleep)
+                else:
+                    self._logger.debug('sleep is 0, exiting')
+                    break
         except KeyboardInterrupt:
             pass
 
@@ -127,7 +134,6 @@ class DBDownload(object):
         self._mkdir(self.local_dir)  # Make sure root directory exists.
 
         tree = {}
-        changed = False
         while True:
             # Check for anything missing locally.
             changed = self._check_missing()
@@ -138,7 +144,7 @@ class DBDownload(object):
             except Exception as e:
                 self._logger.error('error getting delta')
                 self._logger.exception(e)
-                continue
+                return
             if result['reset']:
                 self._logger.debug('delta reset')
 
@@ -164,10 +170,8 @@ class DBDownload(object):
                 if changed and self.executable:
                     self._launch(self.executable)
 
-                # Done processing delta, sleep and check again.
-                tree = {}
-                self._logger.debug('sleeping for %d seconds' % (self.sleep))
-                time.sleep(self.sleep)
+                # Done processing delta
+                return
 
     # Launch a program if anything has changed.
     def _launch(self, prg):
