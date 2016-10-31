@@ -9,7 +9,7 @@ import sys
 import time
 from base64 import b64decode
 from ConfigParser import SafeConfigParser
-from optparse import OptionParser
+from argparse import ArgumentParser
 from dropbox import client, session
 import posixpath as dropboxpath
 from dateutil import parser as timeparser, tz as timezone
@@ -416,24 +416,24 @@ class FakeSecHead(object):
             return self.fp.readline()
 
 
-def parse_config(cfg, opts):
+def parse_config(cfg):
     parser = SafeConfigParser()
     try:
         fp = open(os.path.expanduser(cfg), 'r')
     except:
         print 'Warning: can\'t open %s, using default values' % cfg
-        return
+        return {}
     parser.readfp(FakeSecHead(fp))
     fp.close()
 
+    opts = {}
     for section_name in parser.sections():
         for name, value in parser.items(section_name):
-            if name not in opts:
-                raise Exception(u'Invalid config file option \'%s\'' % name)
             opts[name] = value
+    return opts
 
 
-def create_logger(log, verbose):
+def create_logger(log, verbose, quiet):
     FORMAT = '%(asctime)-15s %(message)s'
     console = log.strip() == '-'
     if console:
@@ -441,6 +441,8 @@ def create_logger(log, verbose):
     logger = logging.getLogger(LOGGER)
     if verbose:
         logger.setLevel(logging.DEBUG)
+    elif quiet:
+        logger.setLevel(logging.WARNING)
     else:
         logger.setLevel(logging.INFO)
     if not console:
@@ -453,58 +455,53 @@ def create_logger(log, verbose):
 
 
 def main():
-    options = {'log': '-', 'config': '~/dbdownload.conf',
-               'cache': '~/.dbdownload.cache', 'interval': 300, 'source': None,
-               'target': None, 'verbose': False, 'reset': False, 'exec': None,
-               'authorizeonly': False}
+    # First get the config file path
+    parser = ArgumentParser(add_help=False)
+    parser.add_argument('--config', '-c', help='configuration file', default='~/dbdownload.conf')
+    args, remaining_argv = parser.parse_known_args()
 
-    # First parse any command line arguments.
-    parser = OptionParser(description='Do one-way Dropbox synchronization')
-    parser.add_option('--interval', '-i', type=int, help='check interval')
-    parser.add_option('--config', '-c', help='configuration file')
-    parser.add_option('--cache', '-a', help='cache file')
-    parser.add_option('--log', '-l', help='logfile (pass - for console)')
-    parser.add_option('--source', '-s',
+    # Then parse configuration file, use config parameters as defaults
+    defaults = {}
+    if args.config:
+        defaults.update(parse_config(args.config))
+
+    # Finally parse the rest of command line
+    parser = ArgumentParser(description='Do one-way Dropbox synchronization')
+    parser.add_argument('--interval', '-i', type=int, help='check interval',
+                        default=300)
+    parser.add_argument('--cache', '-a', help='cache file',
+                        default='~/.dbdownload.cache')
+    parser.add_argument('--log', '-l', help='logfile (pass - for console)',
+                        default='-')
+    parser.add_argument('--source', '-s', required='source' not in defaults,
                       help='source Dropbox directory to synchronize')
-    parser.add_option('--target', '-t', help='local directory to download to')
-    parser.add_option('--verbose', '-v', action='store_true',
+    parser.add_argument('--target', '-t', help='local directory to download to',
+                        required='target' not in defaults)
+    vgroup = parser.add_mutually_exclusive_group()
+    vgroup.add_argument('--verbose', '-v', action='store_true',
                       help='enable verbose logging')
-    parser.add_option('--reset', '-r', action='store_true',
+    vgroup.add_argument('--quiet', '-q', action='store_true',
+                      help='suppress normal output')
+    parser.add_argument('--reset', '-r', action='store_true',
                       help='reset synchronization')
-    parser.add_option('--authorizeonly', '-u', action='store_true',
+    parser.add_argument('--authorizeonly', '-u', action='store_true',
                       help='only authorize application and exit')
-    parser.add_option('--exec', '-x',
+    parser.add_argument('--exec', '-x',
                       help='execute program when directory has changed')
-    (opts, args) = parser.parse_args()
-    if args:
-        print 'Leftover command line arguments', args
-        sys.exit(1)
+    parser.set_defaults(**defaults)
+    options = parser.parse_args(remaining_argv)
 
-    # Parse configuration file.
-    parse_config((opts.config and [opts.config] or
-                  [options['config']])[0], options)
-
-    # Override parameters from config file with cmdline options.
-    for a in options:
-        v = getattr(opts, a)
-        if v:
-            options[a] = v
-
-    if not options['source'] or not options['target']:
-        error_msg = 'Please provide source and target directories'
-        sys.stderr.write('Error: %s\n' % error_msg)
-        sys.exit(-1)
 
     locale.setlocale(locale.LC_ALL, 'C')  # To parse time correctly.
 
-    logger = create_logger(options['log'], options['verbose'])
+    logger = create_logger(options.log, options.verbose, options.quiet)
     logger.info(u'*** DBdownload v%s starting up ***' % (VERSION))
 
-    dl = DBDownload(options['source'], options['target'], options['cache'],
-                    options['interval'], options['exec'])
-    if options['reset']:
+    dl = DBDownload(options.source, options.target, options.cache,
+                    options.interval, getattr(options,'exec'))
+    if options.reset:
         dl.reset()
-    if not opts.authorizeonly:
+    if not options.authorizeonly:
         dl.start()
     else:
         dl.reset()
