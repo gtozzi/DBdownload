@@ -4,22 +4,21 @@ import json
 import locale
 import logging
 import os
+import posixpath as dropboxpath
 import subprocess
 import sys
 import time
 from base64 import b64decode
 from ConfigParser import SafeConfigParser
 from argparse import ArgumentParser
-from dropbox import client, session
-import posixpath as dropboxpath
-from dateutil import parser as timeparser, tz as timezone
 
+import dropbox
+import jsonpickle
 
 # Globals.
 # Got encoded dropbox app key at
 # https://dl-web.dropbox.com/spa/pjlfdak1tmznswp/api_keys.js/public/index.html
 APP_KEY = 'bYeHLWKRctA=|ld63MffhrcyQrbyLTeKvTqxE5cQ3ed1YL2q87GOL/g=='
-ACCESS_TYPE = 'dropbox'  # should be 'dropbox' or 'app_folder'
 LOGGER = 'dbdownload'
 VERSION = '0.0'
 
@@ -62,6 +61,7 @@ def decode_dropbox_key(key):
 
 
 class DBDownload(object):
+
     def __init__(self, remote_dir, local_dir, cache_file, sleep=600, prg=None):
         self._logger = logging.getLogger(LOGGER)
 
@@ -85,13 +85,26 @@ class DBDownload(object):
         self._cursor = None
         self._load_state()
 
-        key, secret = decode_dropbox_key(APP_KEY)
-        self.sess = DBSession(key, secret, access_type=ACCESS_TYPE)
-        if self._token:
-            self.sess.set_token(self._token[0], self._token[1])
-        else:
-            self._token = self.sess.link()
-        self.client = client.DropboxClient(self.sess)
+        if self._token is None:
+            key, secret = decode_dropbox_key(APP_KEY)
+            auth_flow = dropbox.DropboxOAuth2FlowNoRedirect(key, secret)
+            auth_url = auth_flow.start()
+            print "1. Go to: " + auth_url
+            print "2. Click \"Allow\" (you might have to log in first)."
+            print "3. Copy the authorization code."
+            auth_code = raw_input("Enter the authorization code here: ").strip()
+            try:
+                oauth_result = auth_flow.finish(auth_code)
+            except Exception:
+                self._logger.error("Invalid authorization code. Exiting.")
+                sys.exit(1)
+            self._token = oauth_result.access_token
+
+        try:
+            self.client = dropbox.Dropbox(self._token)
+        except Exception as e:
+            self._logger.exception("Unable to connect to Dropbox.")
+            sys.exit(1)
 
     def reset(self):
         self._logger.debug('resetting local state')
@@ -138,24 +151,24 @@ class DBDownload(object):
             # Check for anything missing locally.
             changed = self._check_missing()
 
-            # Get delta results from Dropbox.
+            # If we don't have a cursor yet, call files_list_folder
             try:
-                result = self.client.delta(cursor=self._cursor)
+                if self._cursor is None:
+                    result = self.client.files_list_folder(self.remote_dir, recursive=True)
+                else:
+                    result = self.client.files_list_folder_continue(self._cursor)
             except Exception as e:
-                self._logger.error('error getting delta')
+                self._logger.error('error getting file list')
                 self._logger.exception(e)
                 return
-            if result['reset']:
-                self._logger.debug('delta reset')
 
-            for path, metadata in result['entries']:
-                if os.path.commonprefix([
-                    path, self.remote_dir]) == self.remote_dir:
-                    tree[path] = metadata
+            for entry in result.entries:
+                if os.path.commonprefix([entry.path_lower, self.remote_dir]) == self.remote_dir:
+                    tree[entry.path_lower] = entry
 
-            self._cursor = result['cursor']
+            self._cursor = result.cursor
 
-            if not result['has_more']:
+            if not result.has_more:
                 if tree:
                     self._apply_delta(tree)
                     merged = dict(self._tree.items() + tree.items())
@@ -225,7 +238,7 @@ class DBDownload(object):
 
                 try:
                     line = f.readline()  # Tree.
-                    self._tree = json.loads(line)
+                    self._tree = jsonpickle.decode(line)
                     self._logger.debug('loaded local tree')
                 except Exception as e:
                     self._logger.warn('can\'t load cache state')
@@ -240,12 +253,7 @@ class DBDownload(object):
             f.write(''.join([json.dumps(self.remote_dir), '\n']))
             f.write(''.join([json.dumps(self._token), '\n']))
             f.write(''.join([json.dumps(self._cursor), '\n']))
-            f.write(''.join([json.dumps(self._tree), '\n']))
-
-    def _get_modt(self, modstr):
-        mod = timeparser.parse(modstr).astimezone(timezone.tzlocal())
-        t = time.mktime(mod.timetuple())
-        return t
+            f.write(''.join([jsonpickle.encode(self._tree), '\n']))
 
     # Check for files/folders missing or modified locally.
     def _check_missing(self):
@@ -255,18 +263,20 @@ class DBDownload(object):
         for key, meta in self._tree.items():
             if not meta:
                 continue
-            local_path = unicode(self._remote2local(meta['path']))
-            t = self._get_modt(meta.get('client_mtime', meta['modified']))
+            local_path = unicode(self._remote2local(meta.path_display))
+
             if not os.path.exists(local_path.encode('utf-8')):
-                if meta['is_dir']:
+                if type(meta) is dropbox.files.FolderMetadata:
                     dirs.append((key, local_path))
                 else:
+                    t = time.mktime(meta.client_modified.timetuple())
                     files.append((key, local_path, t))
-            elif not meta['is_dir']:
+            elif type(meta) is dropbox.files.FileMetadata:
+                t = time.mktime(meta.client_modified.timetuple())
                 stat = os.stat(local_path.encode('utf-8'))
                 if stat.st_mtime != t:
                     self._logger.debug(u'%s has been modified locally' %
-                                       (local_path))
+                                       local_path)
                     files.append((key, local_path, t))
 
         dirs.sort()  # Make sure we're creating them in order.
@@ -284,31 +294,27 @@ class DBDownload(object):
     # Apply any outstanding change.
     def _apply_delta(self, tree):
         self._logger.debug('applying changes in tree')
-        rm = [self._tree[n]['path'] for n in tree if not tree[n] and n in
+        rm = [self._tree[n].path_display for n in tree if not tree[n] and n in
               self._tree and self._tree[n]]
         rm.sort(reverse=True)
         for path in rm:
             self._remove(self._remote2local(path))  # Remove file/directory.
 
-        dirs = [n for n in tree if tree[n] and tree[n]['is_dir']]
-        dirs.sort()  # Make sure we're creating them in order.
+        dirs = sorted([n for n in tree if tree[n] and type(tree[n]) is dropbox.files.FolderMetadata])
 
         for d in dirs:
-            rev = d in tree and tree[d]['revision'] or -1
-            oldrev = d in self._tree and self._tree[d]['revision'] or -1
-            if oldrev < rev:
-                local_path = self._remote2local(tree[d]['path'])
-                self._mkdir(local_path)
+            # Directories no longer have revision info in v2, so just make it regardless
+            self._mkdir(self._remote2local(tree[d].path_display))
 
-        files = [n for n in tree if tree[n] and not tree[n]['is_dir']]
+        files = [n for n in tree if tree[n] and type(tree[n]) is dropbox.files.FileMetadata]
 
         for f in files:
-            rev = f in tree and tree[f]['revision'] or -1
-            oldrev = f in self._tree and self._tree[f]['revision'] or -1
-            if oldrev < rev:
-                local_path = self._remote2local(tree[f]['path'])
-                self._get_file(f, local_path,
-                               self._get_modt(tree[f]['modified']))
+            rev = f in tree and tree[f].rev or -1
+            oldrev = f in self._tree and self._tree[f].rev or -1
+            # Revisions are no longer simple ints, so the best we can do is check equality, not order
+            if oldrev != rev:
+                local_path = self._remote2local(tree[f].path_display)
+                self._get_file(f, local_path, time.mktime(tree[f].client_modified.timetuple()))
 
     # Remove anything that is not in dropbox.
     def _cleanup_target(self):
@@ -321,9 +327,9 @@ class DBDownload(object):
                 path = os.path.join(root, d)
                 key = self._local2remote(path).lower()
                 if (key not in self._tree or
-                    self._remote2local(self._tree[key]['path']) != path):
+                        self._remote2local(self._tree[key].path_display) != path):
                     rmdirs.append(d)
-                    self._logger.info(u'RM -RF %s' % (path))
+                    self._logger.info(u'RM -RF %s' % path)
                     self._rmrf(path)
                     changed = True
 
@@ -334,8 +340,8 @@ class DBDownload(object):
                 path = os.path.join(root, f).decode('utf-8')
                 key = self._local2remote(path).lower()
                 if (key not in self._tree or
-                    self._remote2local(self._tree[key]['path']) != path):
-                    self._logger.info(u'RM %s' % (path))
+                        self._remote2local(self._tree[key].path_display) != path):
+                    self._logger.info(u'RM %s' % path)
                     self._rm(path)
                     changed = True
 
@@ -371,37 +377,18 @@ class DBDownload(object):
         self._logger.info(u'FETCH %s -> %s' %
                           (unicode(from_path), unicode(to_path)))
         try:
-            f, metadata = self.client.get_file_and_metadata(from_path)
+            self.client.files_download_to_file(to_path.encode('utf-8'), from_path.encode('utf-8'))
         except Exception as e:
             self._logger.error('error fetching file')
             self._logger.exception(e)
             return  # Will check later if we've got everything.
 
-        to_file = open(os.path.expanduser(to_path.encode('utf-8')), 'wb')
-        to_file.write(f.read())
-        to_file.close()
         if modified:
             os.utime(to_path.encode('utf-8'), (modified, modified))
 
 
-class DBSession(session.DropboxSession):
-    def link(self):
-        request_token = self.obtain_request_token()
-
-        url = self.build_authorize_url(request_token)
-        print 'URL:', url
-        print 'Please authorize this URL in the browser and then press enter'
-        raw_input()
-
-        self.obtain_access_token(request_token)
-        self.set_token(self.token.key, self.token.secret)
-        return [self.token.key, self.token.secret]
-
-    def unlink(self):
-        session.DropboxSession.unlink(self)
-
-
 class FakeSecHead(object):
+
     def __init__(self, fp):
         self.fp = fp
         self.sechead = '[asection]\n'
@@ -420,7 +407,7 @@ def parse_config(cfg):
     parser = SafeConfigParser()
     try:
         fp = open(os.path.expanduser(cfg), 'r')
-    except:
+    except Exception:
         print 'Warning: can\'t open %s, using default values' % cfg
         return {}
     parser.readfp(FakeSecHead(fp))
@@ -495,7 +482,7 @@ def main():
     locale.setlocale(locale.LC_ALL, 'C')  # To parse time correctly.
 
     logger = create_logger(options.log, options.verbose, options.quiet)
-    logger.info(u'*** DBdownload v%s starting up ***' % (VERSION))
+    logger.info(u'*** DBdownload v%s starting up ***' % VERSION)
 
     dl = DBDownload(options.source, options.target, options.cache,
                     options.interval, getattr(options,'exec'))
@@ -508,3 +495,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
